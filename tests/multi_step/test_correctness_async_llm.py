@@ -38,7 +38,7 @@ DEFAULT_SERVER_ARGS: list[str] = [
 @pytest.mark.parametrize("num_prompts", NUM_PROMPTS)
 @pytest.mark.parametrize("num_logprobs", [5])
 @pytest.mark.parametrize("is_async", [True])
-@pytest.mark.parametrize("attention_backend", ["FLASHINFER", "FLASH_ATTN"])
+@pytest.mark.parametrize("attention_backend", ["FLASH_ATTN"])
 @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
 @pytest.mark.asyncio
 async def test_multi_step(

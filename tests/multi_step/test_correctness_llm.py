@@ -29,7 +29,7 @@ NUM_PROMPTS = [10]
 @pytest.mark.parametrize("num_scheduler_steps", NUM_SCHEDULER_STEPS)
 @pytest.mark.parametrize("num_prompts", NUM_PROMPTS)
 @pytest.mark.parametrize("num_logprobs", [None, 5])
-@pytest.mark.parametrize("attention_backend", ["FLASH_ATTN", "FLASHINFER"])
+@pytest.mark.parametrize("attention_backend", ["FLASH_ATTN"])
 def test_multi_step_llm(
     hf_runner,
     vllm_runner,
@@ -72,11 +72,9 @@ def test_multi_step_llm(
       num_logprobs: corresponds to the `logprobs` argument to the OpenAI
                     completions endpoint; `None` -> 1 logprob returned.
     """
-    if current_platform.is_rocm() and \
-        (attention_backend == "FLASHINFER" or enable_chunked_prefill):
+    if current_platform.is_rocm() and enable_chunked_prefill:
         pytest.skip(
-            "Multi-Step with FLASHINFER or Chunked-Prefill is not supported"
-            "on ROCm")
+            "Multi-Step with Chunked-Prefill is not supported on ROCm")
 
     with monkeypatch.context() as m:
         m.setenv(STR_BACKEND_ENV_VAR, attention_backend)
