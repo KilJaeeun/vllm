@@ -513,8 +513,17 @@ class LoRAModelManager(AdapterModelManager):
             # All lora layers share the same punica_wrapper based on reference.
             new_module.set_mapping(self.punica_wrapper)
 
+        # PaCA post-patch: replace LoRA layers with PaCA concat-GEMM layers
+        if os.environ.get("VLLM_PACA_ENABLED") == "1":
+            from vllm.lora.paca_patch import (patch_manager_for_paca,
+                                              patch_model_for_paca)
+            patch_model_for_paca(self.model, self.lora_config,
+                                max_loras=self.lora_slots)
+            patch_manager_for_paca(self)
+
     def register_module(self, module_name: str, module: "BaseLayerWithLoRA"):
-        assert isinstance(module, BaseLayerWithLoRA)
+        from vllm.lora.paca_layer import PaCALinearLayer
+        assert isinstance(module, (BaseLayerWithLoRA, PaCALinearLayer))
         self.modules[module_name] = module
 
     def create_dummy_lora(
