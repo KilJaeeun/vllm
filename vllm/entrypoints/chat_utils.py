@@ -653,6 +653,8 @@ def _resolve_items(
         mm_uuids["image"] = [uuid for data, uuid in items_by_modality["image_embeds"]]
     if "image" in items_by_modality:
         mm_data["image"] = [data for data, uuid in items_by_modality["image"]]
+    if "discrete_image" in items_by_modality:
+        mm_data["discrete_image"] = [data for data, uuid in items_by_modality["discrete_image"]]
         mm_uuids["image"] = [uuid for data, uuid in items_by_modality["image"]]
     if "audio_embeds" in items_by_modality:
         mm_data["audio"] = _get_embeds_data(
@@ -909,6 +911,12 @@ class MultiModalContentParser(BaseMultiModalContentParser):
             audio = self._connector.fetch_audio(video_url) if video_url else None
             audio_placeholder = self._tracker.add("audio", (audio, uuid))
             self._add_placeholder("audio", audio_placeholder)
+
+
+    def parse_discrete_image(self, indices: list, uuid: str | None = None) -> None:
+        import torch
+        tensor = torch.tensor(indices, dtype=torch.long)
+        self._tracker.add("discrete_image", (tensor, uuid))
 
 
 class AsyncMultiModalContentParser(BaseMultiModalContentParser):
@@ -1364,6 +1372,8 @@ def _parse_chat_message_content_mm_part(
         # Raise an error if no 'type' or direct URL is found.
         raise ValueError("Missing 'type' field in multimodal part.")
 
+    if "discrete_image_url" in part:
+        return "discrete_image_url", part.get("discrete_image_url", {}).get("indices", [])
     if not isinstance(part_type, str):
         raise ValueError("Invalid 'type' field in multimodal part.")
     return part_type, "unknown part_type content"
@@ -1486,6 +1496,9 @@ def _parse_chat_message_content_part(
         str_content = cast(str, content)
         mm_parser.parse_video(str_content, uuid)
         modality = "video"
+    elif part_type == "discrete_image_url":
+        mm_parser.parse_discrete_image(content, uuid)
+        return None
     else:
         raise NotImplementedError(f"Unknown part type: {part_type}")
 
