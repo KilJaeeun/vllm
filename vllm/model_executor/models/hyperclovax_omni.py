@@ -603,6 +603,15 @@ class HyperCLOVAXOmniDummyInputsBuilder(BaseDummyInputsBuilder[HyperCLOVAXOmniPr
 class HyperCLOVAXOmniMultiModalProcessor(
     BaseMultiModalProcessor[HyperCLOVAXOmniProcessingInfo]
 ):
+    def _validate_mm_placeholders(self, mm_placeholders, mm_item_counts):
+        # HyperCLOVAX-SEED-Omni uses discrete token streams for audio and
+        # image generation (discrete_audio / discrete_image), which have no
+        # continuous patch placeholders in the prompt.  Skip those modalities
+        # in the base-class validation to avoid "0 placeholders found" errors.
+        _SKIP = {"audio", "discrete_audio", "discrete_image"}
+        filtered = {k: v for k, v in mm_item_counts.items() if k not in _SKIP}
+        super()._validate_mm_placeholders(mm_placeholders, filtered)
+
     def _call_hf_processor(
         self,
         prompt: str,

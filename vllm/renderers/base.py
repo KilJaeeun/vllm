@@ -700,6 +700,15 @@ class BaseRenderer(ABC, Generic[_T]):
     def process_for_engine(
         self, prompt: TokPrompt, arrival_time: float
     ) -> ProcessorInputs:
+        # Short-circuit: if the prompt already carries a "type" field it is
+        # already a fully-formed ProcessorInputs (e.g. MultiModalInputs with
+        # mm_kwargs produced by mm_processor.apply()).  Re-running
+        # _process_singleton would call _process_tokens which creates a plain
+        # TokenInputs and silently drops mm_kwargs (pixel_values etc.).
+        if isinstance(prompt, dict) and "type" in prompt:
+            prompt["arrival_time"] = arrival_time  # type: ignore[index]
+            return prompt  # type: ignore[return-value]
+
         engine_prompt: ProcessorInputs
         if "encoder_prompt" in prompt:
             engine_prompt = self._process_enc_dec(prompt)  # type: ignore[arg-type]
