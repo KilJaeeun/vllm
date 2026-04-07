@@ -10,6 +10,7 @@ import pytest
 
 from vllm.transformers_utils.repo_utils import (
     any_pattern_in_repo_files,
+    get_hf_file_to_dict,
     is_mistral_model_repo,
     list_filtered_repo_files,
 )
@@ -34,10 +35,10 @@ def test_list_filtered_repo_files(
         subfolder.mkdir()
         (path_tmp_dir / "json_file.json").touch()
         (path_tmp_dir / "correct_2.txt").touch()
-        (path_tmp_dir / "incorrect.txt").touch()
-        (path_tmp_dir / "incorrect.jpeg").touch()
+        (path_tmp_dir / "uncorrect.txt").touch()
+        (path_tmp_dir / "uncorrect.jpeg").touch()
         (subfolder / "correct.txt").touch()
-        (subfolder / "incorrect_sub.txt").touch()
+        (subfolder / "uncorrect_sub.txt").touch()
 
         def _glob_path() -> list[str]:
             return [
@@ -86,7 +87,7 @@ def test_one_filtered_repo_files(allow_patterns: list[str], expected_bool: bool)
         path_tmp_dir = Path(tmp_dir)
         subfolder = path_tmp_dir / "subfolder"
         subfolder.mkdir()
-        (path_tmp_dir / "incorrect.jpeg").touch()
+        (path_tmp_dir / "uncorrect.jpeg").touch()
         (subfolder / "correct.txt").touch()
 
         def _glob_path() -> list[str]:
@@ -156,3 +157,50 @@ def test_is_mistral_model_repo(files: list[str], expected_bool: bool):
             repo_type="model",
             token="token",
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for HFValidationError handling in get_hf_file_to_dict
+# ---------------------------------------------------------------------------
+
+def test_get_hf_file_to_dict_returns_none_on_hf_validation_error():
+    """get_hf_file_to_dict must return None (not raise) when hf_hub_download
+    raises HFValidationError.
+
+    This happens when `model` is a local path that does not look like a
+    valid HuggingFace repo-id — e.g. a .mar decoder path such as
+    "decoder/audio/NCZSCosybigvganDecoder.mar" used by the
+    HyperCLOVAX-SEED-Omni-8B audio decoder stage.
+    """
+    from huggingface_hub.errors import HFValidationError
+
+    with patch(
+        "vllm.transformers_utils.repo_utils.hf_hub_download",
+        side_effect=HFValidationError("not a valid repo id"),
+    ):
+        result = get_hf_file_to_dict("config.json", "decoder/audio/NCZSCosybigvganDecoder.mar")
+    assert result is None, (
+        "get_hf_file_to_dict must return None for local .mar paths "
+        "that trigger HFValidationError, not propagate the exception"
+    )
+
+
+def test_get_hf_file_to_dict_reads_local_json_file():
+    """get_hf_file_to_dict reads a local JSON file without hitting HF Hub."""
+    import json
+    payload = {"model_type": "hcx_omni", "vocab_size": 200064}
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        config_path = Path(tmp_dir) / "config.json"
+        config_path.write_text(json.dumps(payload))
+
+        result = get_hf_file_to_dict("config.json", tmp_dir)
+
+    assert result == payload
+
+
+def test_get_hf_file_to_dict_returns_none_for_missing_local_file():
+    """get_hf_file_to_dict returns None when local file does not exist."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        result = get_hf_file_to_dict("nonexistent.json", tmp_dir)
+    assert result is None
