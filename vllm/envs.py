@@ -47,6 +47,8 @@ if TYPE_CHECKING:
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
+    VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE: bool = False
+    VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_MODE_FLAGS: int = 16
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -797,6 +799,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         bool(int(os.environ["VLLM_USE_FLASHINFER_SAMPLER"]))
         if "VLLM_USE_FLASHINFER_SAMPLER" in os.environ
         else True
+    ),
+    # Opt-in native DiffusionGemma denoise sampler. The current backend is the
+    # exact mode16 materialized cuBLAS/warp-stats path and falls back when a
+    # request requires unsupported features.
+    "VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE": lambda: bool(
+        int(os.getenv("VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE", "0"))
+    ),
+    "VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_MODE_FLAGS": lambda: int(
+        os.getenv("VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_MODE_FLAGS", "16")
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),

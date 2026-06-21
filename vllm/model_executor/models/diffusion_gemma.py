@@ -26,8 +26,11 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import AutoModel
 
+import vllm._custom_ops as ops
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -61,6 +64,14 @@ from .interfaces import (
 )
 
 logger = init_logger(__name__)
+
+_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE = (
+    envs.VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE
+)
+_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_MODE_FLAGS = (
+    envs.VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_MODE_FLAGS
+)
+_DIFFUSION_GEMMA_FLASHDENOISE_SEED = 0xD1FF600D
 
 
 class DiffusionGemmaSelfConditioning(nn.Module):
@@ -1061,6 +1072,7 @@ class DiffusionSampler:
         # computed in the sampler (see _compiled_sample_step).
         self.embed_weight = embed_weight
         self.normalizer = normalizer
+        self.normalizer_float = float(normalizer.detach().cpu().item())
         self.canvas_length = (
             diffusion_config.canvas_length if diffusion_config is not None else 32
         )
@@ -1093,6 +1105,7 @@ class DiffusionSampler:
         # Populated after the post-sample kernel detects convergence; consumed
         # on the subsequent commit step when num_sampled=CANVAS_LEN.
         self._pending_logprobs: dict[int, LogprobsTensors] = {}
+        self._native_flashdenoise_calls = 0
 
     def add_request(self, req_idx: int, prompt_len: int, sampling_params: Any) -> None:
         if use_penalty(sampling_params):
@@ -1107,6 +1120,280 @@ class DiffusionSampler:
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()
+
+    def _apply_denoise_step_outputs(
+        self,
+        decode_slots: torch.Tensor,
+        decode_idx: torch.Tensor,
+        all_slots: torch.Tensor,
+        valid_canvas_len: torch.Tensor,
+        is_committing: torch.Tensor,
+        new_tokens: torch.Tensor,
+        argmax_tokens: torch.Tensor,
+        token_entropy: torch.Tensor,
+        soft_embeds: torch.Tensor,
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+    ) -> None:
+        states = self.diffusion_states
+        num_decode = decode_slots.shape[0]
+        device = decode_slots.device
+        CL = self.canvas_length
+        ST = states.stability_threshold
+
+        mean_entropy = token_entropy.mean(dim=-1)
+        states.confident[decode_slots] = mean_entropy < self.confidence_threshold
+
+        sorted_ent, sorted_idx = torch.sort(token_entropy, dim=-1)
+        cumsum_ent = torch.cumsum(sorted_ent, dim=-1)
+        cummax_ent = torch.cummax(sorted_ent, dim=-1).values
+        sorted_mask = (cumsum_ent - cummax_ent) <= self.entropy_bound
+        eb_mask = torch.zeros_like(sorted_mask)
+        eb_mask.scatter_(1, sorted_idx, sorted_mask)
+
+        is_commit = is_committing
+        is_denoise = ~is_commit
+        cur_step = states.step[decode_slots].float()
+        new_step_val = torch.where(
+            is_denoise,
+            (cur_step + 1).to(states.step.dtype),
+            states.step.new_zeros(num_decode),
+        )
+        states.step[decode_slots] = new_step_val
+
+        random_tokens = torch.randint(
+            0,
+            self.vocab_size,
+            (num_decode, CL),
+            device=device,
+            dtype=states.canvas.dtype,
+        )
+        denoise_canvas = torch.where(eb_mask, new_tokens, random_tokens)
+        states.canvas[decode_slots] = torch.where(
+            is_commit.unsqueeze(1), random_tokens, denoise_canvas
+        )
+
+        hist_len = states.accepted_canvas_history_len[decode_slots]
+        write_pos = hist_len % ST
+        for i in range(ST):
+            write_here = ((write_pos == i) & is_denoise).unsqueeze(1)
+            states.accepted_canvas_history[decode_slots, i] = torch.where(
+                write_here,
+                argmax_tokens,
+                states.accepted_canvas_history[decode_slots, i],
+            )
+
+        states.argmax_canvas[decode_slots] = torch.where(
+            is_denoise.unsqueeze(1), argmax_tokens, states.argmax_canvas[decode_slots]
+        )
+
+        new_hist_len = torch.where(
+            is_denoise, hist_len + 1, hist_len.new_zeros(num_decode)
+        )
+        states.accepted_canvas_history_len[decode_slots] = new_hist_len
+
+        sampled[decode_idx] = states.argmax_canvas[decode_slots].to(
+            sampled.dtype
+        ) * is_commit.unsqueeze(1).to(sampled.dtype)
+        num_sampled[decode_idx] = is_commit.to(num_sampled.dtype) * valid_canvas_len.to(
+            num_sampled.dtype
+        )
+
+        ref = states.accepted_canvas_history[decode_slots, 0]
+        mismatch = torch.zeros(num_decode, device=device, dtype=torch.int32)
+        for h in range(1, ST):
+            mismatch = (
+                mismatch
+                + (ref != states.accepted_canvas_history[decode_slots, h])
+                .sum(dim=-1)
+                .int()
+            )
+        stable = mismatch == 0
+
+        step_after = states.step[decode_slots]
+        converged = (stable & states.confident[decode_slots] & (new_hist_len >= ST)) | (
+            step_after >= states.max_denoising_steps
+        )
+        states.is_encoder_phase[decode_slots] = torch.where(
+            is_commit, is_commit.new_zeros(num_decode), converged
+        )
+
+        sc_keep = (is_denoise & ~states.is_encoder_phase[decode_slots])[:, None, None]
+        states.self_conditioning_embeds[decode_slots] = (soft_embeds * sc_keep).to(
+            states.self_conditioning_embeds.dtype
+        )
+
+        newly_converged = (converged & is_denoise).unsqueeze(1)
+        states.canvas[decode_slots] = torch.where(
+            newly_converged,
+            states.argmax_canvas[decode_slots],
+            states.canvas[decode_slots],
+        )
+
+        self.req_states.draft_tokens[all_slots, :CL] = states.canvas[all_slots]
+
+    def sample_from_hidden_states(
+        self,
+        model: Any,
+        hidden_states: torch.Tensor,
+        input_batch: Any,
+    ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor] | None:
+        if not _DIFFUSION_GEMMA_FLASHDENOISE_NATIVE:
+            return None
+        if model is None or input_batch is None or input_batch.num_draft_tokens == 0:
+            return None
+        if get_tp_group().world_size != 1:
+            logger.warning_once(
+                "VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE=1 requires TP=1; "
+                "falling back to the standard DiffusionGemma sampler."
+            )
+            return None
+
+        lm_head_weight = getattr(getattr(model, "lm_head", None), "weight", None)
+        if not isinstance(lm_head_weight, torch.Tensor):
+            return None
+        lm_head_weight = lm_head_weight[: self.vocab_size]
+        embed_weight = self.embed_weight[: self.vocab_size]
+        if (
+            embed_weight.shape != lm_head_weight.shape
+            or embed_weight.data_ptr() != lm_head_weight.data_ptr()
+        ):
+            logger.warning_once(
+                "VLLM_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE=1 requires tied "
+                "full-vocab LM-head/embedding weights; falling back to the "
+                "standard DiffusionGemma sampler."
+            )
+            return None
+        if (
+            hidden_states.dtype != torch.bfloat16
+            or lm_head_weight.dtype != torch.bfloat16
+            or not hidden_states.is_cuda
+            or not lm_head_weight.is_cuda
+            or not lm_head_weight.is_contiguous()
+        ):
+            return None
+
+        num_reqs = input_batch.num_reqs
+        device = hidden_states.device
+        states = self.diffusion_states
+        CL = self.canvas_length
+        slots_np = input_batch.idx_mapping_np[:num_reqs]
+        per_req_nlogits_np = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
+
+        decode_indices_np = np.where(per_req_nlogits_np > 0)[0]
+        prefill_indices_np = np.where(per_req_nlogits_np == 0)[0]
+        decode_slots_np = slots_np[decode_indices_np]
+
+        num_decode = len(decode_indices_np)
+        if num_decode == 0:
+            return None
+        max_num_logprobs = self.sampling_states.max_num_logprobs(slots_np)
+        if max_num_logprobs >= 0:
+            return None
+
+        if len(prefill_indices_np) > 0:
+            self._finish_prefills(input_batch, prefill_indices_np)
+
+        self._decode_slots.np[:num_decode] = decode_slots_np
+        self._decode_idx.np[:num_decode] = decode_indices_np
+        self._decode_slots.copy_to_uva()
+        self._decode_idx.copy_to_uva()
+        decode_slots = self._decode_slots.gpu[:num_decode]
+        decode_idx = self._decode_idx.gpu[:num_decode]
+
+        valid_canvas_len_np = per_req_nlogits_np[per_req_nlogits_np > 0]
+        valid_canvas_len = async_copy_to_gpu(
+            valid_canvas_len_np.astype(np.int64), device=device
+        )
+        if valid_canvas_len_np.min() < CL:
+            ar = torch.arange(CL, device=device)
+            starts = valid_canvas_len.cumsum(0) - valid_canvas_len
+            valid = ar.unsqueeze(0) < valid_canvas_len.unsqueeze(1)
+            src = (starts.unsqueeze(1) + ar.unsqueeze(0)).clamp_max(
+                hidden_states.shape[0] - 1
+            )
+            hidden_states = hidden_states[src.reshape(-1)] * valid.reshape(
+                -1, 1
+            ).to(hidden_states.dtype)
+
+        sampled = self._sampled[:num_reqs]
+        num_sampled = self._num_sampled[:num_reqs]
+        sampled.zero_()
+        num_sampled.zero_()
+        all_slots = input_batch.idx_mapping[:num_reqs]
+        is_committing = states.is_encoder_phase[decode_slots].clone()
+
+        rows = num_decode * CL
+        hidden_2d = hidden_states.reshape(rows, -1).contiguous()
+        steps_f = states.step[decode_slots].float()
+        remaining = (states.max_denoising_steps - steps_f).clamp(min=1.0)
+        temp = self.t_min + (self.t_max - self.t_min) * (
+            remaining / states.max_denoising_steps
+        )
+        logit_scale = (
+            1.0 / temp[:, None].clamp(min=1e-10).expand(num_decode, CL)
+        ).reshape(rows).contiguous()
+
+        entropy = torch.empty(rows, device=device, dtype=torch.float32)
+        sample_values = torch.empty(rows, device=device, dtype=torch.float32)
+        sample_indices = torch.empty(rows, device=device, dtype=torch.int64)
+        clean_values = torch.empty(rows, device=device, dtype=torch.float32)
+        clean_indices = torch.empty(rows, device=device, dtype=torch.int64)
+        soft_embed = torch.empty(
+            rows, hidden_2d.shape[-1], device=device, dtype=torch.float32
+        )
+
+        logger.info_once(
+            "Using native DiffusionGemma FlashDenoise pre-logit path "
+            "(mode_flags=%d).",
+            _DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_MODE_FLAGS,
+        )
+        ops.diffusion_gemma_flashdenoise_scaled(
+            entropy,
+            sample_values,
+            sample_indices,
+            clean_values,
+            clean_indices,
+            soft_embed,
+            hidden_2d,
+            lm_head_weight,
+            logit_scale,
+            self.normalizer_float,
+            final_logit_softcapping=float(
+                getattr(model, "final_logit_softcapping", 0.0) or 0.0
+            ),
+            mode_flags=_DIFFUSION_GEMMA_FLASHDENOISE_NATIVE_MODE_FLAGS,
+            rng_seed=_DIFFUSION_GEMMA_FLASHDENOISE_SEED,
+            rng_offset=self._native_flashdenoise_calls,
+        )
+        self._native_flashdenoise_calls += 1
+
+        self._apply_denoise_step_outputs(
+            decode_slots,
+            decode_idx,
+            all_slots,
+            valid_canvas_len,
+            is_committing,
+            sample_indices.reshape(num_decode, CL),
+            clean_indices.reshape(num_decode, CL),
+            entropy.reshape(num_decode, CL),
+            soft_embed.reshape(num_decode, CL, -1),
+            sampled,
+            num_sampled,
+        )
+        sampler_output = self._build_output(
+            input_batch,
+            sampled,
+            num_sampled,
+            per_req_nlogits_np,
+            device,
+            logprobs_tensors=None,
+        )
+        return (
+            sampler_output,
+            sampler_output.num_sampled,
+            sampler_output.num_rejected,
+        )
 
     @property
     def penalties_state(self):
